@@ -1,0 +1,63 @@
+# Hourly fold trigger for the attestbook venue.
+#
+# WHY THIS LIVES HERE. The venue promises that every accepted entry is folded into the signed tree
+# within the hour, so that anyone can be given an inclusion proof for it. That promise was supposed
+# to be kept by a Cloudflare Cron Trigger, and on this account the trigger has never fired once
+# (attestbook IMPL_NOTES #40/#47): registered, listed by the API, deployed alongside a `scheduled`
+# handler, and silent. The stop-gap was an hourly launchd job on the operator's Mac, which keeps the
+# promise only while that Mac is awake — which is to say, not at night.
+#
+# So the trigger moved off both of them and onto a machine neither the venue nor the operator owns.
+# This repository is the venue's public witness, it is public, and Actions minutes on public
+# repositories are free (https://docs.github.com/en/billing/managed-billing/about-billing-for-github-actions
+# — "GitHub Actions usage is free for standard GitHub-hosted runners in public repositories").
+#
+# WHAT IT CAN DO. It sends ATTESTBOOK_FOLD_SECRET, which authorises exactly one endpoint and
+# nothing else: it cannot export the log, read an entry, or revoke a key. Folding is idempotent, so
+# a doubled run, a delayed run, or a run racing the operator's launchd net is harmless.
+#
+# TWO THINGS TO KNOW ABOUT GitHub's OWN SCHEDULER. It is best-effort and runs late under load, which
+# is why :20 rather than :00 (the top of the hour is the busiest slot). And GitHub disables
+# scheduled workflows in a repository with 60 days of no activity — this repository receives a
+# commit from the venue whenever the tree grows, which is what keeps it awake.
+name: fold
+
+on:
+  schedule:
+    - cron: "20 * * * *"
+  workflow_dispatch:
+
+# Nothing in this job reads or writes this repository.
+permissions: {}
+
+concurrency:
+  group: attestbook-fold
+  cancel-in-progress: false
+
+jobs:
+  fold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: POST /v1/log/fold
+        env:
+          FOLD_SECRET: ${{ secrets.ATTESTBOOK_FOLD_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FOLD_SECRET}" ]; then
+            echo "::error::ATTESTBOOK_FOLD_SECRET is not set on this repository."
+            exit 1
+          fi
+          # --fail-with-body so a 4xx/5xx fails the run AND still shows what the venue said.
+          # The secret goes in a header from the environment, so it never reaches the log or ps.
+          code=$(curl -sS --fail-with-body -o body.json -w '%{http_code}' \
+            -X POST "https://attestbook.iguchi-apps.workers.dev/v1/log/fold" \
+            -H "x-fold-secret: ${FOLD_SECRET}" \
+            -H "content-length: 0" \
+            --retry 3 --retry-delay 10 --retry-all-errors --max-time 60) || {
+              echo "::error::fold call failed"; cat body.json; exit 1;
+            }
+          echo "HTTP ${code}"
+          cat body.json
+          # A 200 whose body says nothing was folded is a success: an idle hour has nothing to fold.
+          python3 -c "import json,sys; d=json.load(open('body.json'))['data']; print('folded', d['folded'], d['from'], '->', d['to'], 'by', d.get('triggered_by'))"
